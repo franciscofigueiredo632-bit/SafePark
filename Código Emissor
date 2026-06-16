@@ -1,0 +1,86 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+uint8_t broadcastAddress[] = {0xC8, 0x2E, 0x18, 0x80, 0xF7, 0x60};
+#define LCD_CS 15
+#define LCD_DC 2
+#define LCD_RST 4
+#define LCD_BLK 32
+#define TRIG 21
+#define ECHO 22
+#define BUZZER 13
+#define LED_V 25
+#define LED_A 26
+#define LED_R 27
+
+Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
+
+float ultimaDistanciaEnviada = 0;
+unsigned long tempoUltimaMudanca = 0;
+
+void setup() {
+  pinMode(LCD_BLK, OUTPUT); digitalWrite(LCD_BLK, HIGH);
+  pinMode(TRIG, OUTPUT); pinMode(ECHO, INPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LED_V, OUTPUT); pinMode(LED_A, OUTPUT); pinMode(LED_R, OUTPUT);
+
+  tft.init(135, 240);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+
+  WiFi.mode(WIFI_STA);
+  esp_now_init();
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  esp_now_add_peer(&peerInfo);
+}
+
+void loop() {
+  // Leitura com filtro simples
+  digitalWrite(TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  float leituraAtual = pulseIn(ECHO, HIGH, 25000) * 0.034 / 2;
+
+  // Só processa se a mudança for relevante (> 0.5cm) para evitar flicker
+  if (abs(leituraAtual - ultimaDistanciaEnviada) > 0.5) {
+    ultimaDistanciaEnviada = leituraAtual;
+    tempoUltimaMudanca = millis();
+    
+    // Envia dados
+    esp_now_send(broadcastAddress, (uint8_t *) &leituraAtual, sizeof(leituraAtual));
+
+    // Atualiza Ecrã apenas na área do número (evita piscar o ecrã todo)
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); // O segundo parâmetro desenha fundo preto
+    tft.setCursor(50, 65);
+    tft.setTextSize(4);
+    if (leituraAtual > 0 && leituraAtual < 100) {
+       tft.printf("%.1f cm  ", leituraAtual);
+    }
+  }
+
+  // Lógica de desligar por inatividade (10 segundos parado)
+  if (millis() - tempoUltimaMudanca > 10000) {
+    digitalWrite(LCD_BLK, LOW);
+    digitalWrite(LED_V, LOW); digitalWrite(LED_A, LOW); digitalWrite(LED_R, LOW);
+    noTone(BUZZER);
+    float msgOff = -1;
+    esp_now_send(broadcastAddress, (uint8_t *) &msgOff, sizeof(msgOff));
+  } else {
+    digitalWrite(LCD_BLK, HIGH);
+    // LEDs e Buzzer sem usar delays longos
+    digitalWrite(LED_V, (leituraAtual > 10 && leituraAtual <= 15));
+    digitalWrite(LED_A, (leituraAtual > 5 && leituraAtual <= 10));
+    digitalWrite(LED_R, (leituraAtual > 0 && leituraAtual <= 5));
+    
+    if (leituraAtual > 0 && leituraAtual <= 15) {
+      if (leituraAtual <= 3) tone(BUZZER, 1000);
+      else {
+        tone(BUZZER, 1000); delay(40); noTone(BUZZER); // Pulso curto
+      }
+    } else { noTone(BUZZER); }
+  }
+  delay(50); 
+}

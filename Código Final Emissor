@@ -1,0 +1,104 @@
+#include <Adafruit_GFX.h>       // Biblioteca base para gráficos da Adafruit
+#include <Adafruit_ST7789.h>    // Biblioteca específica para o controlador do ecrã ST7789
+#include <esp_now.h>            // Biblioteca do protocolo de comunicação sem fios ESP-NOW
+#include <WiFi.h>               // Biblioteca necessária para ativar as funções de rádio/Wi-Fi do ESP32
+
+// Endereço MAC físico do ESP32 Recetor (Interior do carro) para onde os dados serão enviados
+uint8_t broadcastAddress[] = {0xC8, 0x2E, 0x18, 0x80, 0xF7, 0x60};
+
+// Definição dos pinos de ligação do Hardware na placa Ideaspark
+#define LCD_CS 15   // Pino Chip Select do ecrã LCD
+#define LCD_DC 2    // Pino Data/Command do ecrã LCD
+#define LCD_RST 4   // Pino Reset do ecrã LCD
+#define LCD_BLK 32  // Pino Backlight (Controlo do brilho da luz de fundo) do LCD
+#define TRIG 21     // Pino Trigger do sensor ultrassónico (Envia o pulso)
+#define ECHO 22     // Pino Echo do sensor ultrassónico (Recebe o pulso)
+#define BUZZER 13   // Pino de controlo do sinalizador sonoro (Buzzer)
+#define LED_V 25    // Pino do LED Verde
+#define LED_A 26    // Pino do LED Amarelo
+#define LED_R 27    // Pino do LED Vermelho
+
+// Inicialização do objeto do ecrã LCD com os respetivos pinos de controlo
+Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
+
+float ultimaDistanciaEnviada = 0;   // Guarda o último valor estável enviado para comparar
+unsigned long tempoUltimaMudanca = 0; // Armazena o tempo em milissegundos desde a última alteração de distância
+
+void setup() {
+  Serial.begin(115200); // Inicia a comunicação Serial para monitorização/depuração a 115200 baud
+  
+  // Configuração dos pinos do LCD, Sensores e Atuadores como saídas ou entradas
+  pinMode(LCD_BLK, OUTPUT); digitalWrite(LCD_BLK, HIGH); // Define backlight como saída e liga a luz de fundo
+  pinMode(TRIG, OUTPUT); pinMode(ECHO, INPUT);         // Configura os pinos de disparo e receção do sensor
+  pinMode(BUZZER, OUTPUT);                              // Configura o pino do buzzer como saída
+  pinMode(LED_V, OUTPUT); pinMode(LED_A, OUTPUT); pinMode(LED_R, OUTPUT); // Configura pinos dos LEDs como saídas
+
+  // Inicialização e configuração do ecrã LCD local
+  tft.init(135, 240);          // Inicializa o ecrã com a resolução nativa de 135x240 píxeis
+  tft.setRotation(1);          // Roda a orientação do ecrã para o modo Paisagem (Horizontal)
+  tft.fillScreen(ST77XX_BLACK); // Limpa o ecrã pintando-o totalmente de preto
+
+  // Configuração da comunicação sem fios (ESP-NOW)
+  WiFi.mode(WIFI_STA); // Configura o rádio do ESP32 no modo Estação (obrigatório para ESP-NOW)
+  if (esp_now_init() != ESP_OK) { Serial.println("Erro ESP-NOW"); return; } // Inicia o protocolo ESP-NOW
+
+  // Registo do dispositivo parceiro (Peer) que vai receber a informação
+  esp_now_peer_info_t peerInfo = {};            // Cria a estrutura de dados para o parceiro
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6); // Copia o endereço MAC definido para a estrutura
+  peerInfo.channel = 0;                         // Define o canal de comunicação automático (0)
+  peerInfo.encrypt = false;                     // Desativa a criptografia para maior velocidade e menor latência
+  esp_now_add_peer(&peerInfo);                  // Adiciona o parceiro à lista de comunicação do ESP32
+}
+
+void loop() {
+  // Execução da leitura do sensor ultrassónico HC-SR04
+  digitalWrite(TRIG, LOW); delayMicroseconds(2);    // Garante um pulso baixo limpo no pino Trigger
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);  // Envia um pulso alto de 10 microssegundos para disparar o sensor
+  digitalWrite(TRIG, LOW);                          // Corta o pulso de disparo
+  long duracao = pulseIn(ECHO, HIGH, 25000);        // Mede o tempo em que o pino Echo fica HIGH (Timeout de 25ms)
+  float leituraAtual = (duracao == 0) ? -1 : (duracao * 0.034 / 2); // Calcula a distância em cm baseada na velocidade do som
+
+  // Filtro de ruído: Só processa e envia dados se a variação for superior a 0.5 cm
+  if (abs(leituraAtual - ultimaDistanciaEnviada) > 0.5) {
+    ultimaDistanciaEnviada = leituraAtual; // Atualiza a última distância estável registada
+    tempoUltimaMudanca = millis();         // Reinicia o temporizador de atividade pois houve movimento
+    
+    // Envia o valor atualizado da distância em tempo real "pelo ar" para o recetor no painel
+    esp_now_send(broadcastAddress, (uint8_t *) &leituraAtual, sizeof(leituraAtual));
+
+    // Atualização inteligente do ecrã local (Escreve apenas na área do número)
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); // Texto branco com fundo preto sobrepõe e apaga o número antigo sem flicker
+    tft.setCursor(0, 20); tft.setTextSize(2);     // Define posição e tamanho do título
+    tft.println(" DISTANCIA:");                  // Escreve o texto de cabeçalho
+    tft.setCursor(50, 65); tft.setTextSize(4);    // Define posição e tamanho grande para o valor numérico
+    if (leituraAtual > 0 && leituraAtual < 100) {
+       tft.printf("%.1f cm  ", leituraAtual);    // Mostra a distância formatada com uma casa decimal
+    }
+  }
+
+  // Lógica de Standby por Inatividade: Se a distância for idêntica por mais de 10 segundos (Carro Parado)
+  if (millis() - tempoUltimaMudanca > 10000) {
+    digitalWrite(LCD_BLK, LOW); // Desliga a luz de fundo do ecrã local para poupar energia
+    digitalWrite(LED_V, LOW); digitalWrite(LED_A, LOW); digitalWrite(LED_R, LOW); // Desliga todos os LEDs físicos
+    noTone(BUZZER);            // Garante que o alarme sonoro fica em silêncio
+    float msgOff = -1;         // Define um valor de controlo (-1) que sinaliza "Desligar"
+    esp_now_send(broadcastAddress, (uint8_t *) &msgOff, sizeof(msgOff)); // Envia o sinal de desligar para o interior do carro
+  } else {
+    // Caso o sistema esteja ativo e em movimento
+    digitalWrite(LCD_BLK, HIGH); // Mantém ou liga a luz de fundo do LCD local
+    
+    // Controlo dos LEDs Físicos de aviso de acordo com as faixas de distância
+    digitalWrite(LED_V, (leituraAtual > 10 && leituraAtual <= 15)); // Liga Verde entre 10cm e 15cm
+    digitalWrite(LED_A, (leituraAtual > 5 && leituraAtual <= 10));  // Liga Amarelo entre 5cm e 10cm
+    digitalWrite(LED_R, (leituraAtual > 0 && leituraAtual <= 5));   // Liga Vermelho abaixo de 5cm
+    
+    // Controlo de som contínuo ou em pulsos rápidos baseado na proximidade
+    if (leituraAtual > 0 && leituraAtual <= 15) {
+      if (leituraAtual <= 3) tone(BUZZER, 1000); // Som contínuo (frequência 1000Hz) a menos de 3cm (Perigo Crítico)
+      else {
+        tone(BUZZER, 1000); delay(40); noTone(BUZZER); // Emite um bipe curto rápido sem travar a execução do ecrã
+      }
+    } else { noTone(BUZZER); } // Desliga o som se estiver fora da zona de aviso de 15cm
+  }
+  delay(50); // Pequena pausa de estabilização do ciclo principal (20 leituras por segundo)
+}
